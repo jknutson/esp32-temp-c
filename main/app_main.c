@@ -22,10 +22,34 @@
  * SOFTWARE.
  */
 
+
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "protocol_examples_common.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+#include "lwip/sockets.h"
+#include "lwip/dns.h"
+#include "lwip/netdb.h"
+
 #include "esp_system.h"
 #include "esp_log.h"
+#include "mqtt_client.h"
+#include "driver/gpio.h"
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
 
 #include "owb.h"
 #include "owb_rmt.h"
@@ -34,191 +58,208 @@
 #define GPIO_DS18B20_0       (CONFIG_ONE_WIRE_GPIO)
 #define MAX_DEVICES          (8)
 #define DS18B20_RESOLUTION   (DS18B20_RESOLUTION_12_BIT)
-#define SAMPLE_PERIOD        (1000)   // milliseconds
+#define SAMPLE_PERIOD        (5000)   // milliseconds
 
-_Noreturn void app_main()
+char *TAG = "ESP-DS18B20-C";
+char *MQ_TOPIC_BASE = "iot/esp32";
+
+void app_main()
 {
-    // Override global log level
-    esp_log_level_set("*", ESP_LOG_INFO);
+	// make some some important stuff is setup
+	ESP_ERROR_CHECK(nvs_flash_init());
+	ESP_ERROR_CHECK(esp_netif_init());
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	// this could be improved, see protocols/README.md in esp-idf/examples
+	ESP_ERROR_CHECK(example_connect());
 
-    // To debug, use 'make menuconfig' to set default Log level to DEBUG, then uncomment:
-    //esp_log_level_set("owb", ESP_LOG_DEBUG);
-    //esp_log_level_set("ds18b20", ESP_LOG_DEBUG);
+	// Override global log level
+	esp_log_level_set("*", ESP_LOG_INFO);
 
-    // Stable readings require a brief period before communication
-    vTaskDelay(2000.0 / portTICK_PERIOD_MS);
+	// To debug, use 'make menuconfig' to set default Log level to DEBUG, then uncomment:
+	//esp_log_level_set("owb", ESP_LOG_DEBUG);
+	//esp_log_level_set("ds18b20", ESP_LOG_DEBUG);
 
-    // Create a 1-Wire bus, using the RMT timeslot driver
-    OneWireBus * owb;
-    owb_rmt_driver_info rmt_driver_info;
-    owb = owb_rmt_initialize(&rmt_driver_info, GPIO_DS18B20_0, RMT_CHANNEL_1, RMT_CHANNEL_0);
-    owb_use_crc(owb, true);  // enable CRC check for ROM code
+	// get MAC addr to use as "unique" identifier
+	uint8_t mac_i[6] = {0};
+	esp_read_mac(mac_i, ESP_MAC_WIFI_STA);
+	ESP_LOGI(TAG, "%02X%02X%02X%02X%02X%02X", mac_i[0], mac_i[1], mac_i[2], mac_i[3], mac_i[4], mac_i[5]);
+	char s_mac[13];  // 12 chars + 1 for nul
+	sprintf(s_mac, "%02X%02X%02X%02X%02X%02X", mac_i[0], mac_i[1], mac_i[2], mac_i[3], mac_i[4], mac_i[5]);
 
-    // Find all connected devices
-    printf("Find devices:\n");
-    OneWireBus_ROMCode device_rom_codes[MAX_DEVICES] = {0};
-    int num_devices = 0;
-    OneWireBus_SearchState search_state = {0};
-    bool found = false;
-    owb_search_first(owb, &search_state, &found);
-    while (found)
-    {
-        char rom_code_s[17];
-        owb_string_from_rom_code(search_state.rom_code, rom_code_s, sizeof(rom_code_s));
-        printf("  %d : %s\n", num_devices, rom_code_s);
-        device_rom_codes[num_devices] = search_state.rom_code;
-        ++num_devices;
-        owb_search_next(owb, &search_state, &found);
-    }
-    printf("Found %d device%s\n", num_devices, num_devices == 1 ? "" : "s");
 
-    // In this example, if a single device is present, then the ROM code is probably
-    // not very interesting, so just print it out. If there are multiple devices,
-    // then it may be useful to check that a specific device is present.
+	// Stable readings require a brief period before communication
+	vTaskDelay(2000.0 / portTICK_PERIOD_MS);
 
-    if (num_devices == 1)
-    {
-        // For a single device only:
-        OneWireBus_ROMCode rom_code;
-        owb_status status = owb_read_rom(owb, &rom_code);
-        if (status == OWB_STATUS_OK)
-        {
-            char rom_code_s[OWB_ROM_CODE_STRING_LENGTH];
-            owb_string_from_rom_code(rom_code, rom_code_s, sizeof(rom_code_s));
-            printf("Single device %s present\n", rom_code_s);
-        }
-        else
-        {
-            printf("An error occurred reading ROM code: %d", status);
-        }
-    }
-    else
-    {
-        // Search for a known ROM code (LSB first):
-        // For example: 0x1502162ca5b2ee28
-        OneWireBus_ROMCode known_device = {
-            .fields.family = { 0x28 },
-            .fields.serial_number = { 0xee, 0xb2, 0xa5, 0x2c, 0x16, 0x02 },
-            .fields.crc = { 0x15 },
-        };
-        char rom_code_s[OWB_ROM_CODE_STRING_LENGTH];
-        owb_string_from_rom_code(known_device, rom_code_s, sizeof(rom_code_s));
-        bool is_present = false;
+	// Create a 1-Wire bus, using the RMT timeslot driver
+	OneWireBus * owb;
+	owb_rmt_driver_info rmt_driver_info;
+	owb = owb_rmt_initialize(&rmt_driver_info, GPIO_DS18B20_0, RMT_CHANNEL_1, RMT_CHANNEL_0);
+	owb_use_crc(owb, true);  // enable CRC check for ROM code
 
-        owb_status search_status = owb_verify_rom(owb, known_device, &is_present);
-        if (search_status == OWB_STATUS_OK)
-        {
-            printf("Device %s is %s\n", rom_code_s, is_present ? "present" : "not present");
-        }
-        else
-        {
-            printf("An error occurred searching for known device: %d", search_status);
-        }
-    }
+	// Find all connected devices
+	ESP_LOGI(TAG, "Find devices");
+	OneWireBus_ROMCode device_rom_codes[MAX_DEVICES] = {0};
+	int num_devices = 0;
+	OneWireBus_SearchState search_state = {0};
+	bool found = false;
+	owb_search_first(owb, &search_state, &found);
 
-    // Create DS18B20 devices on the 1-Wire bus
-    DS18B20_Info * devices[MAX_DEVICES] = {0};
-    for (int i = 0; i < num_devices; ++i)
-    {
-        DS18B20_Info * ds18b20_info = ds18b20_malloc();  // heap allocation
-        devices[i] = ds18b20_info;
+	// MQTT
+	esp_mqtt_client_config_t mqtt_cfg = {
+		.uri = CONFIG_BROKER_URL,
+	};
+	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+	esp_mqtt_client_start(client);
+	while (found)
+	{
+		char rom_code_s[17];
+		owb_string_from_rom_code(search_state.rom_code, rom_code_s, sizeof(rom_code_s));
+		printf("  %d : %s\n", num_devices, rom_code_s);
+		device_rom_codes[num_devices] = search_state.rom_code;
+		++num_devices;
+		owb_search_next(owb, &search_state, &found);
+	}
+	printf("Found %d device%s\n", num_devices, num_devices == 1 ? "" : "s");
 
-        if (num_devices == 1)
-        {
-            printf("Single device optimisations enabled\n");
-            ds18b20_init_solo(ds18b20_info, owb);          // only one device on bus
-        }
-        else
-        {
-            ds18b20_init(ds18b20_info, owb, device_rom_codes[i]); // associate with bus and device
-        }
-        ds18b20_use_crc(ds18b20_info, true);           // enable CRC check on all reads
-        ds18b20_set_resolution(ds18b20_info, DS18B20_RESOLUTION);
-    }
+	// In this example, if a single device is present, then the ROM code is probably
+	// not very interesting, so just print it out. If there are multiple devices,
+	// then it may be useful to check that a specific device is present.
 
-//    // Read temperatures from all sensors sequentially
-//    while (1)
-//    {
-//        printf("\nTemperature readings (degrees C):\n");
-//        for (int i = 0; i < num_devices; ++i)
-//        {
-//            float temp = ds18b20_get_temp(devices[i]);
-//            printf("  %d: %.3f\n", i, temp);
-//        }
-//        vTaskDelay(1000 / portTICK_PERIOD_MS);
-//    }
+	if (num_devices == 1)
+	{
+		// For a single device only:
+		OneWireBus_ROMCode rom_code;
+		owb_status status = owb_read_rom(owb, &rom_code);
+		if (status == OWB_STATUS_OK)
+		{
+			char rom_code_s[OWB_ROM_CODE_STRING_LENGTH];
+			owb_string_from_rom_code(rom_code, rom_code_s, sizeof(rom_code_s));
+			printf("Single device %s present\n", rom_code_s);
+		}
+		else
+		{
+			printf("An error occurred reading ROM code: %d", status);
+		}
+	}
+	else
+	{
+		// Search for a known ROM code (LSB first):
+		// For example: 0x1502162ca5b2ee28
+		OneWireBus_ROMCode known_device = {
+			.fields.family = { 0x28 },
+			.fields.serial_number = { 0xee, 0xb2, 0xa5, 0x2c, 0x16, 0x02 },
+			.fields.crc = { 0x15 },
+		};
+		char rom_code_s[OWB_ROM_CODE_STRING_LENGTH];
+		owb_string_from_rom_code(known_device, rom_code_s, sizeof(rom_code_s));
+		bool is_present = false;
 
-    // Check for parasitic-powered devices
-    bool parasitic_power = false;
-    ds18b20_check_for_parasite_power(owb, &parasitic_power);
-    if (parasitic_power) {
-        printf("Parasitic-powered devices detected");
-    }
+		owb_status search_status = owb_verify_rom(owb, known_device, &is_present);
+		if (search_status == OWB_STATUS_OK)
+		{
+			printf("Device %s is %s\n", rom_code_s, is_present ? "present" : "not present");
+		}
+		else
+		{
+			printf("An error occurred searching for known device: %d", search_status);
+		}
+	}
 
-    // In parasitic-power mode, devices cannot indicate when conversions are complete,
-    // so waiting for a temperature conversion must be done by waiting a prescribed duration
-    owb_use_parasitic_power(owb, parasitic_power);
+	// Create DS18B20 devices on the 1-Wire bus
+	DS18B20_Info * devices[MAX_DEVICES] = {0};
+	for (int i = 0; i < num_devices; ++i)
+	{
+		DS18B20_Info * ds18b20_info = ds18b20_malloc();  // heap allocation
+		devices[i] = ds18b20_info;
+
+		if (num_devices == 1)
+		{
+			printf("Single device optimisations enabled\n");
+			ds18b20_init_solo(ds18b20_info, owb);          // only one device on bus
+		}
+		else
+		{
+			ds18b20_init(ds18b20_info, owb, device_rom_codes[i]); // associate with bus and device
+		}
+		ds18b20_use_crc(ds18b20_info, true);           // enable CRC check on all reads
+		ds18b20_set_resolution(ds18b20_info, DS18B20_RESOLUTION);
+	}
+
+	// Check for parasitic-powered devices
+	bool parasitic_power = false;
+	ds18b20_check_for_parasite_power(owb, &parasitic_power);
+	if (parasitic_power) {
+		printf("Parasitic-powered devices detected");
+	}
+
+	// In parasitic-power mode, devices cannot indicate when conversions are complete,
+	// so waiting for a temperature conversion must be done by waiting a prescribed duration
+	owb_use_parasitic_power(owb, parasitic_power);
 
 #ifdef CONFIG_ENABLE_STRONG_PULLUP_GPIO
-    // An external pull-up circuit is used to supply extra current to OneWireBus devices
-    // during temperature conversions.
-    owb_use_strong_pullup_gpio(owb, CONFIG_STRONG_PULLUP_GPIO);
+	// An external pull-up circuit is used to supply extra current to OneWireBus devices
+	// during temperature conversions.
+	owb_use_strong_pullup_gpio(owb, CONFIG_STRONG_PULLUP_GPIO);
 #endif
 
-    // Read temperatures more efficiently by starting conversions on all devices at the same time
-    int errors_count[MAX_DEVICES] = {0};
-    int sample_count = 0;
-    if (num_devices > 0)
-    {
-        TickType_t last_wake_time = xTaskGetTickCount();
+	// Read temperatures more efficiently by starting conversions on all devices at the same time
+	int errors_count[MAX_DEVICES] = {0};
+	int sample_count = 0;
+	if (num_devices > 0) {
+		TickType_t last_wake_time = xTaskGetTickCount();
 
-        while (1)
-        {
-            ds18b20_convert_all(owb);
+		// main loop
+		for (;;) {
+			ds18b20_convert_all(owb);
 
-            // In this application all devices use the same resolution,
-            // so use the first device to determine the delay
-            ds18b20_wait_for_conversion(devices[0]);
+			// In this application all devices use the same resolution,
+			// so use the first device to determine the delay
+			ds18b20_wait_for_conversion(devices[0]);
 
-            // Read the results immediately after conversion otherwise it may fail
-            // (using printf before reading may take too long)
-            float readings[MAX_DEVICES] = { 0 };
-            DS18B20_ERROR errors[MAX_DEVICES] = { 0 };
+			// Read the results immediately after conversion otherwise it may fail
+			// (using printf before reading may take too long)
+			float readings[MAX_DEVICES] = { 0 };
+			DS18B20_ERROR errors[MAX_DEVICES] = { 0 };
 
-            for (int i = 0; i < num_devices; ++i)
-            {
-                errors[i] = ds18b20_read_temp(devices[i], &readings[i]);
-            }
+			for (int i = 0; i < num_devices; ++i) {
+				errors[i] = ds18b20_read_temp(devices[i], &readings[i]);
+			}
 
-            // Print results in a separate loop, after all have been read
-            printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);
-            for (int i = 0; i < num_devices; ++i)
-            {
-                if (errors[i] != DS18B20_OK)
-                {
-                    ++errors_count[i];
-                }
+			// Print results in a separate loop, after all have been read
+			// printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);
+			for (int i = 0; i < num_devices; ++i) {
+				if (errors[i] != DS18B20_OK) {
+					++errors_count[i];
+				}
 
-                printf("  %d: %.1f    %d errors\n", i, readings[i], errors_count[i]);
-            }
+				// printf("  %d: %.1f    %d errors\n", i, readings[i], errors_count[i]);
+				float temp_f = (readings[i] * 9 / 5) + 32;
+				char s_temp_f[8];  // TODO: figure out what size this should be
+				sprintf(s_temp_f, "%.2f", temp_f);
+				char mq_topic_temp_f[128]; // TODO: figure out size of this char array
+				sprintf(mq_topic_temp_f, "%s-%s-%i/temperature_f", MQ_TOPIC_BASE, s_mac, i);
+				// publish MQTT message(s)
+				int temp_f_msg_id = esp_mqtt_client_publish(client, mq_topic_temp_f, s_temp_f, 0, 0, 0);
+				ESP_LOGI(TAG, "MQTT published - topic:%s, payload:%s, id:%i", mq_topic_temp_f, s_temp_f, temp_f_msg_id);
+			}
 
-            vTaskDelayUntil(&last_wake_time, SAMPLE_PERIOD / portTICK_PERIOD_MS);
-        }
-    }
-    else
-    {
-        printf("\nNo DS18B20 devices detected!\n");
-    }
+			vTaskDelayUntil(&last_wake_time, SAMPLE_PERIOD / portTICK_PERIOD_MS);
+		}
+	}
+	else
+	{
+		printf("\nNo DS18B20 devices detected!\n");
+	}
 
-    // clean up dynamically allocated data
-    for (int i = 0; i < num_devices; ++i)
-    {
-        ds18b20_free(&devices[i]);
-    }
-    owb_uninitialize(owb);
+	// clean up dynamically allocated data
+	for (int i = 0; i < num_devices; ++i)
+	{
+		ds18b20_free(&devices[i]);
+	}
+	owb_uninitialize(owb);
 
-    printf("Restarting now.\n");
-    fflush(stdout);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    esp_restart();
+	printf("Restarting now.\n");
+	fflush(stdout);
+	vTaskDelay(1000 / portTICK_PERIOD_MS);
+	esp_restart();
 }
