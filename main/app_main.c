@@ -22,8 +22,6 @@
  * SOFTWARE.
  */
 
-
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -58,9 +56,11 @@
 #define GPIO_DS18B20_0       (CONFIG_ONE_WIRE_GPIO)
 #define MAX_DEVICES          (8)
 #define DS18B20_RESOLUTION   (DS18B20_RESOLUTION_12_BIT)
-#define SAMPLE_PERIOD        (5000)   // milliseconds
+#define SAMPLE_PERIOD        (30000)   // milliseconds
 
 char *TAG = "ESP-DS18B20-C";
+// TODO: revisit all uses of TAG, replace some with OneWireTAG
+// TODO: revisit all calls to ESP_LOGI, evaluate log level for errors especially
 char *MQ_TOPIC_BASE = "iot/esp32";
 
 void app_main()
@@ -114,12 +114,12 @@ void app_main()
 	{
 		char rom_code_s[17];
 		owb_string_from_rom_code(search_state.rom_code, rom_code_s, sizeof(rom_code_s));
-		printf("  %d : %s\n", num_devices, rom_code_s);
+		ESP_LOGI(TAG, "  %d : %s", num_devices, rom_code_s);
 		device_rom_codes[num_devices] = search_state.rom_code;
 		++num_devices;
 		owb_search_next(owb, &search_state, &found);
 	}
-	printf("Found %d device%s\n", num_devices, num_devices == 1 ? "" : "s");
+	ESP_LOGI(TAG, "Found %d device%s", num_devices, num_devices == 1 ? "" : "s");
 
 	// In this example, if a single device is present, then the ROM code is probably
 	// not very interesting, so just print it out. If there are multiple devices,
@@ -134,11 +134,11 @@ void app_main()
 		{
 			char rom_code_s[OWB_ROM_CODE_STRING_LENGTH];
 			owb_string_from_rom_code(rom_code, rom_code_s, sizeof(rom_code_s));
-			printf("Single device %s present\n", rom_code_s);
+			ESP_LOGI(TAG, "Single device %s present", rom_code_s);
 		}
 		else
 		{
-			printf("An error occurred reading ROM code: %d", status);
+			ESP_LOGI(TAG, "An error occurred reading ROM code: %d", status);
 		}
 	}
 	else
@@ -157,11 +157,11 @@ void app_main()
 		owb_status search_status = owb_verify_rom(owb, known_device, &is_present);
 		if (search_status == OWB_STATUS_OK)
 		{
-			printf("Device %s is %s\n", rom_code_s, is_present ? "present" : "not present");
+			ESP_LOGI(TAG, "Device %s is %s", rom_code_s, is_present ? "present" : "not present");
 		}
 		else
 		{
-			printf("An error occurred searching for known device: %d", search_status);
+			ESP_LOGI(TAG, "An error occurred searching for known device: %d", search_status);
 		}
 	}
 
@@ -174,7 +174,7 @@ void app_main()
 
 		if (num_devices == 1)
 		{
-			printf("Single device optimisations enabled\n");
+			ESP_LOGI(TAG, "Single device optimisations enabled");
 			ds18b20_init_solo(ds18b20_info, owb);          // only one device on bus
 		}
 		else
@@ -189,7 +189,7 @@ void app_main()
 	bool parasitic_power = false;
 	ds18b20_check_for_parasite_power(owb, &parasitic_power);
 	if (parasitic_power) {
-		printf("Parasitic-powered devices detected");
+		ESP_LOGI(TAG, "Parasitic-powered devices detected");
 	}
 
 	// In parasitic-power mode, devices cannot indicate when conversions are complete,
@@ -204,7 +204,6 @@ void app_main()
 
 	// Read temperatures more efficiently by starting conversions on all devices at the same time
 	int errors_count[MAX_DEVICES] = {0};
-	int sample_count = 0;
 	if (num_devices > 0) {
 		TickType_t last_wake_time = xTaskGetTickCount();
 
@@ -226,13 +225,12 @@ void app_main()
 			}
 
 			// Print results in a separate loop, after all have been read
-			// printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);
 			for (int i = 0; i < num_devices; ++i) {
 				if (errors[i] != DS18B20_OK) {
 					++errors_count[i];
 				}
 
-				// printf("  %d: %.1f    %d errors\n", i, readings[i], errors_count[i]);
+				// ESP_LOGI(TAG, "  %d: %.1f    %d errors", i, readings[i], errors_count[i]);
 				float temp_f = (readings[i] * 9 / 5) + 32;
 				char s_temp_f[8];  // TODO: figure out what size this should be
 				sprintf(s_temp_f, "%.2f", temp_f);
@@ -248,7 +246,7 @@ void app_main()
 	}
 	else
 	{
-		printf("\nNo DS18B20 devices detected!\n");
+		ESP_LOGI(TAG, "No DS18B20 devices detected!");
 	}
 
 	// clean up dynamically allocated data
@@ -258,7 +256,7 @@ void app_main()
 	}
 	owb_uninitialize(owb);
 
-	printf("Restarting now.\n");
+	ESP_LOGI(TAG, "Restarting now.");
 	fflush(stdout);
 	vTaskDelay(1000 / portTICK_PERIOD_MS);
 	esp_restart();
